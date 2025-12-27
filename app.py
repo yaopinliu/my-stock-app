@@ -11,8 +11,7 @@ st.set_page_config(page_title="全球投資回測 Pro", layout="centered")
 st.markdown("# 📈 全球投資回測系統")
 st.caption("支援美、台、英股 | 換匯台幣 | 股息再投資")
 
-# --- 2. 使用 Form 封裝輸入項 (增加「開始」按鈕) ---
-# 使用 form 可以防止每改一個字就重新載入，讓操作更順暢
+# --- 2. 投資參數設定 (Form 表單) ---
 with st.form("investment_settings"):
     st.subheader("🛠️ 投資配置設定")
     num_assets = st.number_input("標的數量", min_value=1, max_value=20, value=1, step=1)
@@ -20,14 +19,16 @@ with st.form("investment_settings"):
     tickers = []
     weights = []
     
-    # 標的輸入區
     st.markdown("##### 股票與權重設定")
     for i in range(int(num_assets)):
         c1, c2 = st.columns([3, 2])
-        t = c1.text_input(f"代碼 {i+1}", value="0050.TW" if i==0 else "", key=f"t{i}").upper()
+        # 預設值給 VOO 或 0050.TW
+        default_t = "0050.TW" if i == 0 else ""
+        t = c1.text_input(f"代碼 {i+1}", value=default_t, key=f"t{i}").upper().strip()
         w = c2.number_input(f"權重 %", value=100//int(num_assets), key=f"w{i}")
-        tickers.append(t)
-        weights.append(w / 100)
+        if t:
+            tickers.append(t)
+            weights.append(w / 100)
 
     st.divider()
     st.subheader("💰 投入金額與時間")
@@ -36,61 +37,73 @@ with st.form("investment_settings"):
     initial_cash = c_init.number_input("首筆投入 (TWD)", value=3000)
     monthly_invest = c_mon.number_input("每月扣款 (TWD)", value=3000)
 
-    # --- 關鍵：開始按鈕 ---
     submit_button = st.form_submit_button("🚀 開始執行回測")
 
-# --- 3. 極速數據抓取邏輯 (多線程優化) ---
-@st.cache_data(ttl=86400) # 快取 24 小時
-def get_global_data_fast(tickers, start):
-    # 整理所有需要的代碼 (股票 + 匯率)
+# --- 3. 強化版數據抓取函數 ---
+@st.cache_data(ttl=86400)
+def get_global_data_robust(tickers, start):
     needed = set(tickers)
     for t in tickers:
         if t and ".TW" not in t and ".TWO" not in t:
             needed.add("GBPTWD=X" if ".L" in t else "TWD=X")
     
-    # 使用 threads=True 大幅提升多標的下載速度
-    data = yf.download(list(needed), start=start, threads=True, progress=False)['Adj Close']
+    # 下載完整數據
+    raw_data = yf.download(list(needed), start=start, threads=True, progress=False)
     
-    # 處理單一標的情況 (yfinance 回傳 Series 的問題)
-    if isinstance(data, pd.Series): 
-        data = data.to_frame(name=list(needed)[0])
+    if raw_data.empty:
+        return None
+
+    # 處理 yfinance 回傳結構問題 (核心修正處)
+    if len(needed) > 1:
+        # 多標的情況，選取 Adj Close 層
+        data = raw_data['Adj Close']
+    else:
+        # 單一標的情況，直接檢查是否有 Adj Close 欄位
+        if 'Adj Close' in raw_data.columns:
+            data = raw_data[['Adj Close']]
+            data.columns = list(needed) # 重新命名欄位為代碼
+        else:
+            # 備援方案：如果沒有 Adj Close 則取 Close
+            data = raw_data[['Close']]
+            data.columns = list(needed)
+            
     return data.ffill().dropna()
 
-# --- 4. 點擊按鈕後才執行的運算區 ---
+# --- 4. 運算區 ---
 if submit_button:
-    try:
-        # 過濾空的代碼
-        active_tickers = [t for t in tickers if t.strip() != ""]
-        if not active_tickers:
-            st.error("請至少輸入一個標的代碼！")
-            st.stop()
-            
-        if abs(sum(weights) - 1.0) > 0.05: # 容許 5% 以內的微小誤差
-            st.error(f"❌ 總權重必須約為 100% (目前為 {sum(weights)*100:.1f}%)")
-        else:
+    if not tickers:
+        st.error("請輸入至少一個標的代碼！")
+    elif abs(sum(weights) - 1.0) > 0.05:
+        st.error(f"❌ 總權重必須約為 100% (目前為 {sum(weights)*100:.1f}%)")
+    else:
+        try:
             with st.status("⚡ 正在從全球交易所同步數據...", expanded=False) as status:
-                raw_df = get_global_data_fast(active_tickers, start_date)
-                status.update(label="✅ 數據抓取完成，計算回測中...", state="complete")
+                prices_df = get_global_data_robust(tickers, start_date)
+                if prices_df is None:
+                    st.error("抓不到資料，請檢查代碼是否正確或是網路問題。")
+                    st.stop()
+                status.update(label="✅ 數據抓取完成", state="complete")
             
-            # 換匯計算 (確保標的與權重對齊)
-            adj_df = pd.DataFrame(index=raw_df.index)
-            for t in active_tickers:
-                if ".TW" in t or ".TWO" in t:
-                    adj_df[t] = raw_df[t]
-                elif ".L" in t:
-                    adj_df[t] = raw_df[t] * raw_df["GBPTWD=X"]
-                else:
-                    adj_df[t] = raw_df[t] * raw_df["TWD=X"]
+            # 換匯與對齊
+            adj_df = pd.DataFrame(index=prices_df.index)
+            for t in tickers:
+                if t in prices_df.columns:
+                    if ".TW" in t or ".TWO" in t:
+                        adj_df[t] = prices_df[t]
+                    elif ".L" in t:
+                        adj_df[t] = prices_df[t] * prices_df["GBPTWD=X"]
+                    else:
+                        adj_df[t] = prices_df[t] * prices_df["TWD=X"]
             
-            # 報酬率運算
+            # 計算回測
             rets = adj_df.pct_change().dropna()
-            # 根據下載後的欄位順序重新抓權重
-            ordered_weights = [weights[tickers.index(c)] for c in adj_df.columns]
-            p_ret = (rets * ordered_weights).sum(axis=1)
+            # 確保權重與欄位對齊
+            final_weights = [weights[tickers.index(c)] for c in adj_df.columns]
+            p_ret = (rets * final_weights).sum(axis=1)
 
-            # 複利資產價值計算
             val, cost, last_m = initial_cash, initial_cash, -1
             v_hist, c_hist = [], []
+            
             for d, r in p_ret.items():
                 if d.month != last_m:
                     val += monthly_invest
@@ -100,35 +113,21 @@ if submit_button:
                 v_hist.append(val)
                 c_hist.append(cost)
 
-            # --- 結果顯示 ---
+            # --- 顯示圖表 ---
             st.divider()
-            v_final, c_final = v_hist[-1], c_hist[-1]
-            roi = ((v_final / c_final) - 1) * 100
+            v_f, c_f = v_hist[-1], c_hist[-1]
+            roi = ((v_f / c_f) - 1) * 100
             
             m1, m2, m3 = st.columns(3)
-            m1.metric("資產現值 (TWD)", f"${v_final:,.0f}")
-            m2.metric("累積投入成本", f"${c_final:,.0f}")
+            m1.metric("資產現值 (TWD)", f"${v_f:,.0f}")
+            m2.metric("累積投入本金", f"${c_f:,.0f}")
             m3.metric("總報酬率", f"{roi:.2f}%")
 
-            # 圖表展示
             fig = go.Figure()
-            fig.add_trace(go.Scatter(x=p_ret.index, y=v_hist, name="總價值", fill='tozeroy', line=dict(color='#00d1b2')))
-            fig.add_trace(go.Scatter(x=p_ret.index, y=c_hist, name="累積投入", line=dict(dash='dash', color='#718096')))
-            fig.update_layout(height=400, margin=dict(l=0,r=0,t=20,b=0), 
-                              legend=dict(orientation="h", y=1.1, x=1, xanchor="right"))
+            fig.add_trace(go.Scatter(x=p_ret.index, y=v_hist, name="總價值", fill='tozeroy'))
+            fig.add_trace(go.Scatter(x=p_ret.index, y=c_hist, name="投入本金", line=dict(dash='dash')))
             st.plotly_chart(fig, use_container_width=True)
 
-            # 蒙地卡羅 (未來模擬)
-            with st.expander("🔮 未來走勢風險模擬"):
-                mu, std = p_ret.mean(), p_ret.std()
-                f2 = go.Figure()
-                for _ in range(15):
-                    path = [v_final]
-                    for _ in range(252): path.append(path[-1]*(1+np.random.normal(mu, std)))
-                    f2.add_trace(go.Scatter(y=path, mode='lines', opacity=0.3, showlegend=False))
-                st.plotly_chart(f2, use_container_width=True)
-
-    except Exception as e:
-        st.error(f"運算發生問題：{e}")
-else:
-    st.info("💡 請設定好參數後，點擊「🚀 開始執行回測」按鈕。")
+        except Exception as e:
+            st.error(f"運算發生問題：{e}")
+            st.info("提示：如果出現 'Adj Close' 錯誤，請確認標代碼格式是否正確（例如台股要加 .TW）。")
